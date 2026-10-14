@@ -569,3 +569,7 @@ priority = -1
 
 [lints.rustdoc]
 all = "warn"
+
+[[test]]
+name = "native_hook_contract"
+path = "tests/native_hook_contract.rs"

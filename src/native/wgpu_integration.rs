@@ -28,7 +28,7 @@ use log::warn;
 use winit_integration::UserEvent;
 
 use crate::{
-    App, AppCreator, CreationContext, NativeOptions, Result, Storage,
+    App, AppCreator, CreationContext, NativeOptions, NativeViewportHooks, Result, Storage,
     native::{
         epi_integration::EpiIntegration,
         winit_integration::{EventResult, sleep_if_invisible_or_minimized},
@@ -85,6 +85,7 @@ impl Drop for WgpuWinitRunning<'_> {
 /// Wrapped in an `Rc<RefCell<…>>` so it can be re-entrantly shared via a weak-pointer.
 pub struct SharedState {
     egui_ctx: egui::Context,
+    native_viewport_hooks: Option<NativeViewportHooks>,
     viewports: Viewports,
     painter: egui_wgpu::winit::Painter,
     viewport_from_window: HashMap<WindowId, ViewportId>,
@@ -161,6 +162,7 @@ impl<'app> WgpuWinitApp<'app> {
             viewports,
             painter,
             viewport_from_window,
+            native_viewport_hooks,
             ..
         } = &mut *shared;
 
@@ -170,6 +172,7 @@ impl<'app> WgpuWinitApp<'app> {
                 &running.integration.egui_ctx,
                 viewport_from_window,
                 painter,
+                native_viewport_hooks.as_ref(),
             );
         }
     }
@@ -181,6 +184,7 @@ impl<'app> WgpuWinitApp<'app> {
             viewports,
             viewport_from_window,
             painter,
+            native_viewport_hooks,
             ..
         } = &mut *running.shared.borrow_mut();
 
@@ -192,7 +196,13 @@ impl<'app> WgpuWinitApp<'app> {
             None,
             painter,
         )
-        .initialize_window(event_loop, egui_ctx, viewport_from_window, painter);
+        .initialize_window(
+            event_loop,
+            egui_ctx,
+            viewport_from_window,
+            painter,
+            native_viewport_hooks.as_ref(),
+        );
     }
 
     #[cfg(target_os = "android")]
@@ -210,7 +220,7 @@ impl<'app> WgpuWinitApp<'app> {
         egui_ctx: egui::Context,
         event_loop: &ActiveEventLoop,
         storage: Option<Box<dyn Storage>>,
-        window: Window,
+        window: Arc<Window>,
         builder: ViewportBuilder,
     ) -> crate::Result<&mut WgpuWinitRunning<'app>> {
         profiling::function_scope!();
@@ -252,8 +262,6 @@ impl<'app> WgpuWinitApp<'app> {
                 i.pixels_per_point = pixels_per_point;
             });
         }
-
-        let window = Arc::new(window);
 
         {
             profiling::scope!("set_window");
@@ -355,6 +363,7 @@ impl<'app> WgpuWinitApp<'app> {
 
         let shared = Rc::new(RefCell::new(SharedState {
             egui_ctx,
+            native_viewport_hooks: self.native_options.native_viewport_hooks.clone(),
             viewport_from_window,
             viewports,
             painter,
@@ -1055,6 +1064,7 @@ impl Viewport {
         egui_ctx: &egui::Context,
         windows_id: &mut HashMap<WindowId, ViewportId>,
         painter: &mut egui_wgpu::winit::Painter,
+        native_viewport_hooks: Option<&NativeViewportHooks>,
     ) {
         if self.window.is_some() {
             return; // we already have one
@@ -1064,11 +1074,20 @@ impl Viewport {
 
         let viewport_id = self.ids.this;
 
-        match egui_winit::create_window(egui_ctx, event_loop, &self.builder) {
+        match create_viewport_window(
+            egui_ctx,
+            event_loop,
+            self.ids,
+            &self.builder,
+            native_viewport_hooks,
+        ) {
             Ok(window) => {
                 windows_id.insert(window.id(), viewport_id);
 
                 let window = Arc::new(window);
+                if let Some(hooks) = native_viewport_hooks {
+                    hooks.notify_window_created(self.ids, &self.builder, &window);
+                }
 
                 if let Err(err) =
                     pollster::block_on(painter.set_window(viewport_id, Some(Arc::clone(&window))))
@@ -1100,7 +1119,7 @@ fn create_window(
     event_loop: &ActiveEventLoop,
     storage: Option<&dyn Storage>,
     native_options: &mut NativeOptions,
-) -> Result<(Window, ViewportBuilder), winit::error::OsError> {
+) -> Result<(Arc<Window>, ViewportBuilder), winit::error::OsError> {
     profiling::function_scope!();
 
     let window_settings = epi_integration::load_window_settings(storage);
@@ -1112,9 +1131,43 @@ fn create_window(
     )
     .with_visible(false); // Start hidden until we render the first frame to fix white flash on startup (https://github.com/emilk/egui/pull/3631)
 
-    let window = egui_winit::create_window(egui_ctx, event_loop, &viewport_builder)?;
+    let window = create_viewport_window(
+        egui_ctx,
+        event_loop,
+        ViewportIdPair::ROOT,
+        &viewport_builder,
+        native_options.native_viewport_hooks.as_ref(),
+    )?;
     epi_integration::apply_window_settings(&window, window_settings);
+    let window = Arc::new(window);
+    if let Some(hooks) = &native_options.native_viewport_hooks {
+        hooks.notify_window_created(ViewportIdPair::ROOT, &viewport_builder, &window);
+    }
     Ok((window, viewport_builder))
+}
+
+fn create_viewport_window(
+    egui_ctx: &egui::Context,
+    event_loop: &ActiveEventLoop,
+    ids: ViewportIdPair,
+    builder: &ViewportBuilder,
+    native_viewport_hooks: Option<&NativeViewportHooks>,
+) -> Result<Window, winit::error::OsError> {
+    profiling::function_scope!();
+
+    let attributes = egui_winit::apply_monitor_to_window_attributes(
+        egui_winit::create_winit_window_attributes(egui_ctx, builder.clone()),
+        builder,
+        event_loop,
+    );
+    let attributes = if let Some(hooks) = native_viewport_hooks {
+        hooks.apply_window_attributes(ids, builder, attributes)
+    } else {
+        attributes
+    };
+    let window = event_loop.create_window(attributes)?;
+    egui_winit::apply_viewport_builder_to_window(egui_ctx, &window, builder);
+    Ok(window)
 }
 
 /// Is this viewport, or any of its (transitive) descendant viewports, visible?
@@ -1155,6 +1208,7 @@ fn render_immediate_viewport(
             viewports,
             painter,
             viewport_from_window,
+            native_viewport_hooks,
             ..
         } = &mut *shared.borrow_mut();
 
@@ -1168,7 +1222,13 @@ fn render_immediate_viewport(
         );
         if viewport.window.is_none() {
             event_loop_context::with_current_event_loop(|event_loop| {
-                viewport.initialize_window(event_loop, egui_ctx, viewport_from_window, painter);
+                viewport.initialize_window(
+                    event_loop,
+                    egui_ctx,
+                    viewport_from_window,
+                    painter,
+                    native_viewport_hooks.as_ref(),
+                );
             });
         }
 

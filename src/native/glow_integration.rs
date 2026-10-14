@@ -40,7 +40,7 @@ use super::{
 };
 use crate::epaint::textures::TexturesDelta;
 use crate::{
-    App, AppCreator, CreationContext, NativeOptions, Result, Storage,
+    App, AppCreator, CreationContext, NativeOptions, NativeViewportHooks, Result, Storage,
     native::{epi_integration::EpiIntegration, winit_integration::sleep_if_invisible_or_minimized},
 };
 
@@ -102,6 +102,7 @@ impl Drop for GlowWinitRunning<'_> {
 /// `new` fn on all platforms. only on android, do we get multiple resumed events because app can be suspended.
 struct GlutinWindowContext {
     egui_ctx: egui::Context,
+    native_viewport_hooks: Option<NativeViewportHooks>,
 
     swap_interval: glutin::surface::SwapInterval,
     gl_config: glutin::config::Config,
@@ -1088,17 +1089,28 @@ impl GlutinWindowContext {
 
         log::debug!("trying to create glutin Display with config: {config_template_builder:?}");
 
+        let window_attributes = egui_winit::apply_monitor_to_window_attributes(
+            egui_winit::create_winit_window_attributes(egui_ctx, viewport_builder.clone()),
+            &viewport_builder,
+            event_loop,
+        );
+        let window_attributes = if let Some(hooks) = &native_options.native_viewport_hooks {
+            hooks.apply_window_attributes(
+                ViewportIdPair::ROOT,
+                &viewport_builder,
+                window_attributes,
+            )
+        } else {
+            window_attributes
+        };
+
         // Create GL display. This may probably create a window too on most platforms. Definitely on `MS windows`. Never on Android.
         let display_builder = glutin_winit::DisplayBuilder::new()
             // we might want to expose this option to users in the future. maybe using an env var or using native_options.
             //
             // The justification for FallbackEgl over PreferEgl is at https://github.com/emilk/egui/pull/2526#issuecomment-1400229576 .
             .with_preference(glutin_winit::ApiPreference::FallbackEgl)
-            .with_window_attributes(Some(egui_winit::apply_monitor_to_window_attributes(
-                egui_winit::create_winit_window_attributes(egui_ctx, viewport_builder.clone()),
-                &viewport_builder,
-                event_loop,
-            )));
+            .with_window_attributes(Some(window_attributes));
 
         let (window, gl_config) = {
             profiling::scope!("DisplayBuilder::build");
@@ -1122,6 +1134,13 @@ impl GlutinWindowContext {
         if let Some(window) = &window {
             egui_winit::apply_viewport_builder_to_window(egui_ctx, window, &viewport_builder);
         }
+        let window = window.map(|window| {
+            let window = Arc::new(window);
+            if let Some(hooks) = &native_options.native_viewport_hooks {
+                hooks.notify_window_created(ViewportIdPair::ROOT, &viewport_builder, &window);
+            }
+            window
+        });
 
         let gl_display = gl_config.display();
         log::debug!(
@@ -1202,7 +1221,7 @@ impl GlutinWindowContext {
                 pending_delta: Default::default(),
                 viewport_ui_cb: None,
                 gl_surface: None,
-                window: window.map(Arc::new),
+                window,
                 egui_winit: None,
             },
         );
@@ -1214,6 +1233,7 @@ impl GlutinWindowContext {
 
         let mut slf = Self {
             egui_ctx: egui_ctx.clone(),
+            native_viewport_hooks: native_options.native_viewport_hooks.clone(),
             swap_interval,
             gl_config,
             current_gl_context: None,
@@ -1271,6 +1291,11 @@ impl GlutinWindowContext {
                 &viewport.builder,
                 event_loop,
             );
+            let window_attributes = if let Some(hooks) = &self.native_viewport_hooks {
+                hooks.apply_window_attributes(viewport.ids, &viewport.builder, window_attributes)
+            } else {
+                window_attributes
+            };
             if window_attributes.transparent()
                 && self.gl_config.supports_transparency() == Some(false)
                 && !cfg!(target_os = "windows")
@@ -1303,8 +1328,12 @@ impl GlutinWindowContext {
                 &viewport.builder,
             );
 
+            let window = Arc::new(window);
+            if let Some(hooks) = &self.native_viewport_hooks {
+                hooks.notify_window_created(viewport.ids, &viewport.builder, &window);
+            }
             egui_winit::update_viewport_info(&mut viewport.info, &self.egui_ctx, &window, true);
-            viewport.window.insert(Arc::new(window))
+            viewport.window.insert(window)
         };
 
         viewport.egui_winit.get_or_insert_with(|| {

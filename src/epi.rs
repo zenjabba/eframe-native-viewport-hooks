@@ -41,6 +41,73 @@ pub type EventLoopBuilderHook = Box<dyn FnOnce(&mut EventLoopBuilder<UserEvent>)
 #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
 pub type WindowBuilderHook = Box<dyn FnOnce(egui::ViewportBuilder) -> egui::ViewportBuilder>;
 
+/// Customize attributes for each native viewport before its window is created.
+///
+/// Receives the viewport identity, its original builder, and the resolved monitor attributes.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+pub type NativeWindowAttributesHook = std::sync::Arc<
+    dyn Fn(egui::ViewportIdPair, &egui::ViewportBuilder, WindowAttributes) -> WindowAttributes
+        + Send
+        + Sync,
+>;
+
+/// Observe each newly created native window through its authoritative shared handle.
+///
+/// Store a [`std::sync::Weak`] handle when retaining the identity of the window.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+pub type NativeWindowCreatedHook = std::sync::Arc<
+    dyn Fn(egui::ViewportIdPair, &egui::ViewportBuilder, &std::sync::Arc<winit::window::Window>)
+        + Send
+        + Sync,
+>;
+
+/// Repeatable hooks for actual native viewport window creation, including the root.
+///
+/// These callbacks run on the native event-loop thread. They must not reenter egui or the
+/// renderer, panic, or retain a strong window reference. No callback runs for a reused window,
+/// an ordinary title/size update, or renderer-only initialization. A failed window creation
+/// does not invoke `window_created`.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[derive(Clone, Default)]
+pub struct NativeViewportHooks {
+    /// Adjust resolved attributes immediately before native window creation.
+    pub window_attributes: Option<NativeWindowAttributesHook>,
+
+    /// Observe the new window after its builder has been applied and it has been `Arc`-wrapped.
+    pub window_created: Option<NativeWindowCreatedHook>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+impl NativeViewportHooks {
+    pub(crate) fn apply_window_attributes(
+        &self,
+        ids: egui::ViewportIdPair,
+        builder: &egui::ViewportBuilder,
+        attributes: WindowAttributes,
+    ) -> WindowAttributes {
+        if let Some(hook) = &self.window_attributes {
+            hook(ids, builder, attributes)
+        } else {
+            attributes
+        }
+    }
+
+    pub(crate) fn notify_window_created(
+        &self,
+        ids: egui::ViewportIdPair,
+        builder: &egui::ViewportBuilder,
+        window: &std::sync::Arc<winit::window::Window>,
+    ) {
+        if let Some(hook) = &self.window_created {
+            hook(ids, builder, window);
+        }
+    }
+}
+
 type DynError = Box<dyn core::error::Error + Send + Sync>;
 
 /// This is how your app is created.
@@ -359,6 +426,12 @@ pub struct NativeOptions {
     #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
     pub window_builder: Option<WindowBuilderHook>,
 
+    /// Repeatable attributes/created hooks for every newly created native viewport window.
+    ///
+    /// Unlike the consumed `window_builder` hook, these callbacks survive cloning options.
+    #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+    pub native_viewport_hooks: Option<NativeViewportHooks>,
+
     /// On desktop: make the window position to be centered at initialization.
     ///
     /// Platform specific:
@@ -414,6 +487,9 @@ impl Clone for NativeOptions {
             #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
             window_builder: None, // Skip any builder callbacks if cloning
 
+            #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+            native_viewport_hooks: self.native_viewport_hooks.clone(),
+
             #[cfg(feature = "glow")]
             glow_options: self.glow_options.clone(),
 
@@ -450,6 +526,9 @@ impl Default for NativeOptions {
 
             #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
             window_builder: None,
+
+            #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+            native_viewport_hooks: None,
 
             centered: false,
 
